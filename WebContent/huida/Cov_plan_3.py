@@ -12,13 +12,13 @@ import copy
 # 设置matplotlib后端和样式
 plt.rcParams['figure.facecolor'] = 'white'
 plt.rcParams['axes.facecolor'] = 'white'
-
+from enum import Enum
 # 尝试导入所需类，兼容不同运行环境
 try:
     from project_env import ForestEnvironmentVisualizer, TerrainType
 except ImportError:
     # 若无法导入，定义占位类（实际使用时需确保project_env可用）
-    class TerrainType:
+    class TerrainType(Enum):
         GRASS = 0
         TREE = 1
         ROCK = 2

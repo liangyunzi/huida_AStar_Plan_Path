@@ -30,7 +30,7 @@ except ImportError:
         def __init__(self, width, height, seed):
             self.width = width
             self.height = height
-            self.start_pos = (height // 2, width // 2)
+            self.start_pos = (0 , 3)
             self.static_grid = np.random.rand(height, width)
             self.static_terrain_type = np.random.randint(0, 5, size=(height, width))
             self.height_map = np.random.rand(height, width)
@@ -98,6 +98,7 @@ class UnknownMapAStarPlanner:
         self.known_grid = np.zeros((self.height, self.width), dtype=np.float32) - 1  # -1表示未知
         self.known_terrain = np.zeros((self.height, self.width), dtype=np.int32) - 1  # -1表示未知
         self.obstacle_grid = np.zeros((self.height, self.width), dtype=bool)  # 已知障碍物
+        self.start_pos = self.check_obstacle()
 
         # 雷达传感器
         self.radar = RadarSensor(max_range=radar_range)
@@ -190,6 +191,13 @@ class UnknownMapAStarPlanner:
                             break
 
         self.frontier = new_frontier
+
+    def check_obstacle(self):
+        for dy in range (0, self.height):
+            for dx in range(0, self.width):
+                if not self.obstacle_grid[dy, dx]:
+                    return (dy, dx)
+
 
     def heuristic(self, a, b):
         """启发式函数：曼哈顿距离"""
@@ -401,6 +409,8 @@ class UnknownMapAStarPlanner:
         print("开始未知环境全覆盖路径规划...")
         print(f"雷达探测范围: {self.radar.max_range} 单位")
 
+        self.start_pos = self.check_obstacle()
+        # print(f"开始位置: {self.start_pos}")
         current_pos = self.start_pos
         step_count = 0
 

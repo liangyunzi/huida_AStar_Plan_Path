@@ -1,9 +1,11 @@
+# Learning Date : 2025/11/10
 # Learning Date : 2025/10/25
 import numpy as np
 import matplotlib.pyplot as plt
 import matplotlib.patches as patches
 import matplotlib.animation as animation
 from scipy.ndimage import gaussian_filter
+from scipy.interpolate import splprep, splev
 import noise
 import random
 from enum import Enum
@@ -22,6 +24,80 @@ class TerrainType(Enum):
     ROCK = 2  # 岩石
     MUD = 3  # 泥地/建筑
     ANIMAL = 4  # 动物（动态障碍物）
+
+
+class PathSmoother:
+    """路径平滑器"""
+
+    def __init__(self, smoothing_factor=0.1, smooth_points_density=2.0):
+        self.smoothing_factor = smoothing_factor
+        self.smooth_points_density = smooth_points_density
+
+    def smooth_path_b_spline(self, path, s=0.0):
+        """
+        使用B样条曲线平滑路径
+        Args:
+            path: 原始路径点列表 [(y1, x1), (y2, x2), ...]
+            s: 平滑因子，0表示完全平滑，值越大越接近原始路径
+        Returns:
+            smoothed_path: 平滑后的路径
+        """
+        if len(path) < 4:
+            return path  # 点太少无法进行B样条拟合
+
+        # 将路径点转换为numpy数组 (注意坐标顺序)
+        path_array = np.array(path)
+        y_coords = path_array[:, 0]
+        x_coords = path_array[:, 1]
+
+        try:
+            # 使用B样条曲线拟合
+            tck, u = splprep([x_coords, y_coords], s=s, per=False)
+
+            # 生成更密集的插值点
+            num_points = max(50, int(len(path) * self.smooth_points_density))
+            u_new = np.linspace(0, 1, num_points)
+
+            # 计算平滑后的路径
+            x_smooth, y_smooth = splev(u_new, tck)
+
+            # 重新组合为(y, x)格式
+            smoothed_path = list(zip(y_smooth, x_smooth))
+
+            print(f"   - 路径平滑: {len(path)} → {len(smoothed_path)} 个点")
+            return smoothed_path
+
+        except Exception as e:
+            print(f"   - B样条平滑失败: {e}, 使用原始路径")
+            return path
+
+    def smooth_path_simple(self, path, window_size=3):
+        """
+        使用移动平均简单平滑路径
+        Args:
+            path: 原始路径
+            window_size: 滑动窗口大小
+        Returns:
+            smoothed_path: 平滑后的路径
+        """
+        if len(path) < window_size:
+            return path
+
+        smoothed_path = []
+        for i in range(len(path)):
+            # 计算滑动窗口内的平均位置
+            start_idx = max(0, i - window_size // 2)
+            end_idx = min(len(path), i + window_size // 2 + 1)
+
+            window_points = path[start_idx:end_idx]
+            avg_y = np.mean([p[0] for p in window_points])
+            avg_x = np.mean([p[1] for p in window_points])
+
+            smoothed_path.append((avg_y, avg_x))
+
+        print(f"   - 简单平滑: 窗口大小 {window_size}")
+        return smoothed_path
+
 
 class ForestEnvironmentVisualizer:
     """森林环境可视化器"""
@@ -42,7 +118,6 @@ class ForestEnvironmentVisualizer:
 
         # 起点和终点
         self.start_pos = [height * 0.05, width * 0.05]  # 左下角
-#        self.target_pos = [height * 0.95, width * 0.95]  # 右上角
 
         # 障碍物列表
         self.animals = []
@@ -57,7 +132,6 @@ class ForestEnvironmentVisualizer:
         self._generate_rocks()
         self._generate_mud_areas()
         self._clear_start_end_areas()
-        # self._generate_animals()
 
     def _generate_height_map(self):
         """使用Perlin噪声生成平滑地形高度图"""
@@ -147,7 +221,6 @@ class ForestEnvironmentVisualizer:
         """检查位置是否有效"""
         # 检查与起点和终点的距离
         start_dist = np.sqrt((y - self.start_pos[0]) ** 2 + (x - self.start_pos[1]) ** 2)
-#        target_dist = np.sqrt((y - self.target_pos[0]) ** 2 + (x - self.target_pos[1]) ** 2)
 
         if start_dist < radius + min_distance:
             return False
@@ -339,6 +412,7 @@ class ForestEnvironmentVisualizer:
 
         return fig, ax
 
+
 class RadarSensor:
     """雷达传感器类"""
 
@@ -382,6 +456,7 @@ class RadarSensor:
 
         return detected_obstacles, free_space
 
+
 class GridCell:
     """Grid cell class"""
 
@@ -396,6 +471,7 @@ class GridCell:
         self.is_obstacle = False
         self.visit_count = 0
         self.distance_to_uncovered = float('inf')
+
 
 class ImprovedWavefrontPlanner:
     """Improved wavefront coverage planner"""
@@ -431,13 +507,18 @@ class ImprovedWavefrontPlanner:
         # Radar
         self.radar = RadarSensor(max_range=radar_range)
 
+        # Path smoother
+        self.path_smoother = PathSmoother(smoothing_factor=0.1, smooth_points_density=2.0)
+
         # Start position
         start_y, start_x = environment.start_pos
         self.current_cell = self._get_cell_from_pos(start_y, start_x)
         self.current_pos = (int(self.current_cell.center_y), int(self.current_cell.center_x))
 
         # Path record
-        self.path = [self.current_pos]
+        self.raw_path = [self.current_pos]  # 原始路径
+        self.smooth_path = []  # 平滑后的路径
+        self.path = self.raw_path  # 当前使用的路径
         self.use_astar = False
 
         # Initial scan
@@ -675,14 +756,32 @@ class ImprovedWavefrontPlanner:
         # Move to next cell
         self.current_cell = next_cell
         self.current_pos = (int(next_cell.center_y), int(next_cell.center_x))
-        self.path.append(self.current_pos)
+        self.raw_path.append(self.current_pos)
 
         next_cell.is_covered = True
         next_cell.visit_count += 1
 
         return True
 
-    def run_coverage(self, max_steps=5000, target_coverage=0.95):
+    def smooth_final_path(self, method='b_spline'):
+        """
+        平滑最终路径
+        Args:
+            method: 平滑方法 'b_spline' 或 'simple'
+        """
+        print(f"\n开始路径平滑...")
+        print(f"   - 原始路径点数: {len(self.raw_path)}")
+
+        if method == 'b_spline':
+            self.smooth_path = self.path_smoother.smooth_path_b_spline(self.raw_path, s=0.1)
+        else:
+            self.smooth_path = self.path_smoother.smooth_path_simple(self.raw_path, window_size=3)
+
+        # 更新当前使用的路径为平滑后的路径
+        self.path = self.smooth_path
+        print(f"   - 平滑后路径点数: {len(self.smooth_path)}")
+
+    def run_coverage(self, max_steps=5000, target_coverage=0.95, enable_smoothing=True):
         """Run coverage planning"""
         print(f"\nStart coverage planning...")
         print(f"   Strategy: Improved Wavefront (distance field guided) + A* backtrack")
@@ -734,11 +833,16 @@ class ImprovedWavefrontPlanner:
         repeat = (total_visits - covered) / total_visits if total_visits > 0 else 0
 
         print(f"\nPlanning complete:")
-        print(f"   - Total steps: {len(self.path)}")
+        print(f"   - Total steps: {len(self.raw_path)}")
         print(f"   - Explored cells: {explored}")
         print(f"   - Covered cells: {covered}")
         print(f"   - Coverage rate: {coverage * 100:.2f}%")
         print(f"   - Repeat rate: {repeat * 100:.2f}%")
+
+        # 路径平滑
+        if enable_smoothing and len(self.raw_path) > 10:
+            self.smooth_final_path(method='b_spline')
+
 
 class UnknownMapVisualizer:
     """未知环境路径规划可视化器"""
@@ -754,6 +858,8 @@ class UnknownMapVisualizer:
         self.robot_pos2 = None
         self.path_line1 = None
         self.path_line2 = None
+        self.smooth_path_line1 = None  # 平滑路径线
+        self.smooth_path_line2 = None
         self.radar_circle1 = None
         self.radar_circle2 = None
         self.known_map = np.ones((self.env.height, self.env.width, 3)) * 0.8
@@ -775,8 +881,12 @@ class UnknownMapVisualizer:
         self.robot_pos1, = self.ax1.plot([], [], 'ro', markersize=10, alpha=0.9, zorder=5, label='robot')
         self.robot_pos2, = self.ax2.plot([], [], 'ro', markersize=10, alpha=0.9, zorder=5, label='robot')
 
-        self.path_line1, = self.ax1.plot([], [], 'b-', linewidth=2, alpha=0.7, zorder=3, label='path')
-        self.path_line2, = self.ax2.plot([], [], 'b-', linewidth=2, alpha=0.7, zorder=3, label='path')
+        self.path_line1, = self.ax1.plot([], [], 'b-', linewidth=2, alpha=0.7, zorder=3, label='raw path')
+        self.path_line2, = self.ax2.plot([], [], 'b-', linewidth=2, alpha=0.7, zorder=3, label='raw path')
+
+        # 平滑路径线（红色）
+        self.smooth_path_line1, = self.ax1.plot([], [], 'b-', linewidth=3, alpha=0.8, zorder=3, label='smooth path')
+        self.smooth_path_line2, = self.ax2.plot([], [], 'b-', linewidth=3, alpha=0.8, zorder=3, label='smooth path')
 
         self.radar_circle1 = patches.Circle((0, 0), self.planner.radar.max_range,
                                             fill=False, edgecolor='red', linestyle='--',
@@ -871,10 +981,6 @@ class UnknownMapVisualizer:
                 elif cell.is_explored and cell.is_obstacle:
                     # 黑色：障碍物
                     self.known_map[y_start:y_end, x_start:x_end] = [0.1, 0.1, 0.1]
-                # elif cell.is_explored:
-                #     # 白色：可通行
-                #     self.known_map[y_start:y_end, x_start:x_end] = [1, 1, 1]
-                # 未探索的保持原色
 
         ax.imshow(self.known_map, extent=[0, self.env.width, 0, self.env.height],
                   origin='lower', alpha=0.9, zorder=0)
@@ -906,11 +1012,6 @@ class UnknownMapVisualizer:
                                     frontier_points.append((cell.center_y, cell.center_x))
                                     break
 
-        # if frontier_points:
-        #     frontier_y, frontier_x = zip(*frontier_points)
-        #     ax.scatter(frontier_x, frontier_y, c='red', s=20, alpha=0.6,
-        #                marker='.', zorder=3, label='Boundary point')
-
         ax.set_xlim(-1, self.env.width)
         ax.set_ylim(-1, self.env.height)
         ax.set_aspect('equal')
@@ -929,7 +1030,7 @@ class UnknownMapVisualizer:
         ]
         ax.legend(handles=legend_elements, loc='upper left', bbox_to_anchor=(1.05, 1))
 
-    def animate_exploration(self, interval=50):
+    def animate_exploration(self, interval=50, show_smooth_path=True):
         """创建探索过程动画"""
         if not self.planner.path:
             print("请先执行路径规划!")
@@ -940,18 +1041,18 @@ class UnknownMapVisualizer:
         def init():
             self.robot_pos1.set_data([], [])
             self.robot_pos2.set_data([], [])
-            self.path_line1.set_data([], [])
-            self.path_line2.set_data([], [])
+            self.smooth_path_line1.set_data([], [])
+            self.smooth_path_line2.set_data([], [])
             self.radar_circle1.center = (0, 0)
             self.radar_circle2.center = (0, 0)
             return (self.robot_pos1, self.robot_pos2,
-                    self.path_line1, self.path_line2,
+                    self.smooth_path_line1, self.smooth_path_line2,
                     self.radar_circle1, self.radar_circle2)
 
         def update(frame):
             if frame >= len(self.planner.path):
                 return (self.robot_pos1, self.robot_pos2,
-                        self.path_line1, self.path_line2,
+                        self.smooth_path_line1, self.smooth_path_line2,
                         self.radar_circle1, self.radar_circle2)
 
             current_pos = self.planner.path[frame]
@@ -968,20 +1069,32 @@ class UnknownMapVisualizer:
 
             self.radar_history.append((x_pos, y_pos))  # 存储当前雷达中心
             # 控制历史记录数量，避免内存占用过大
-            if len(self.radar_history) > 1000:
+            if len(self.radar_history) > 2000:
                 self.radar_history.pop(0)
 
-            path_x = []
-            path_y = []
-            # 更新路径线
-            if frame > 0:
-                path_x = [p[1] for p in self.planner.path[:frame + 1]]
-                path_y = [p[0] for p in self.planner.path[:frame + 1]]
-                self.path_line1.set_data(path_x, path_y)
-                self.path_line2.set_data(path_x, path_y)
+            smooth_path_x = []
+            smooth_path_y = []
+
+            # 更新原始路径线
+
+            # 更新平滑路径线（如果存在且需要显示）
+            if show_smooth_path and hasattr(self.planner, 'smooth_path') and self.planner.smooth_path:
+                # 计算当前帧对应的平滑路径点
+                if frame < len(self.planner.smooth_path):
+                    # 逐步显示平滑路径：从起点到当前帧位置
+                    current_smooth_segment = self.planner.smooth_path[:frame + 1]
+                    smooth_path_x = [p[1] for p in current_smooth_segment]
+                    smooth_path_y = [p[0] for p in current_smooth_segment]
+                else:
+                    # 如果帧数超过平滑路径长度，显示完整路径
+                    smooth_path_x = [p[1] for p in self.planner.smooth_path]
+                    smooth_path_y = [p[0] for p in self.planner.smooth_path]
+
+                self.smooth_path_line1.set_data(smooth_path_x, smooth_path_y)
+                self.smooth_path_line2.set_data(smooth_path_x, smooth_path_y)
 
             # 更新右侧地图（每5帧更新一次以提高性能）
-            if frame % 3 == 0 or frame == len(self.planner.path) - 1:
+            if frame % 5 == 0 or frame == len(self.planner.path) - 1:
                 self.ax2.clear()
                 unknown_map = np.ones((self.env.height, self.env.width, 3)) * 0.8
                 # 转为RGBA格式（增加alpha通道控制透明度）
@@ -1007,7 +1120,18 @@ class UnknownMapVisualizer:
 
                 # 重新创建右侧动态元素
                 self.robot_pos2, = self.ax2.plot([x_pos], [y_pos], 'ro', markersize=10, alpha=0.9, zorder=5)
-                self.path_line2, = self.ax2.plot(path_x, path_y, 'b-', linewidth=2, alpha=0.7, zorder=3)
+
+                if show_smooth_path and smooth_path_x and smooth_path_y:
+                    if frame < len(self.planner.smooth_path):
+                        current_smooth_segment = self.planner.smooth_path[:frame + 1]
+                        smooth_display_x = [p[1] for p in current_smooth_segment]
+                        smooth_display_y = [p[0] for p in current_smooth_segment]
+                    else:
+                        smooth_display_x = [p[1] for p in self.planner.smooth_path]
+                        smooth_display_y = [p[0] for p in self.planner.smooth_path]
+
+                    self.smooth_path_line2, = self.ax2.plot(smooth_display_x, smooth_display_y, 'b-',
+                                                            linewidth=3, alpha=0.8, zorder=4)
 
                 # 绘制当前雷达范围
                 self.radar_circle2 = patches.Circle(
@@ -1019,13 +1143,11 @@ class UnknownMapVisualizer:
                 self._plot_known_map(self.ax2,
                                      f"known map (process: {(frame + 1) / len(self.planner.path) * 100:.1f}%)")
 
-
-
             progress = (frame + 1) / len(self.planner.path) * 100
             self.ax1.set_title(f'True_Env (Process: {progress:.1f}%)', fontsize=12, fontweight='bold')
 
             return (self.robot_pos1, self.robot_pos2,
-                    self.path_line1, self.path_line2,
+                    self.smooth_path_line1, self.smooth_path_line2,
                     self.radar_circle1, self.radar_circle2)
 
         anim = animation.FuncAnimation(
@@ -1039,6 +1161,7 @@ class UnknownMapVisualizer:
     def clear_radar_history(self):
         self.radar_history.pop(0)
 
+
 def main():
     """主函数：创建并可视化森林环境"""
     print("🌲 森林环境可视化器")
@@ -1049,12 +1172,12 @@ def main():
     # 波前法规划
     planner = ImprovedWavefrontPlanner(env, radar_range=5, cell_size=2)
     # 执行覆盖规划
-    planner.run_coverage(max_steps=3000, target_coverage=0.99)
+    planner.run_coverage(max_steps=3000, target_coverage=0.99, enable_smoothing=True)
 
     # 可视化
     visualizer = UnknownMapVisualizer(env, planner)
     print("\n🎬 开始探索动画演示...")
-    anim = visualizer.animate_exploration(interval=20)
+    anim = visualizer.animate_exploration(interval=20, show_smooth_path=True)
 
     return env, planner, anim
 

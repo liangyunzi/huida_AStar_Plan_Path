@@ -11,6 +11,8 @@ import random
 from enum import Enum
 from collections import deque
 import heapq
+import math
+from sklearn.cluster import DBSCAN  # 用于将散乱的边界点聚类成区域
 
 # 设置matplotlib后端和样式
 plt.rcParams['figure.facecolor'] = 'white'
@@ -535,27 +537,45 @@ class ImprovedWavefrontPlanner:
         col = min(int(x / self.cell_size), self.grid_cols - 1)
         return self.grid[row][col]
 
+    # def _scan_and_update(self):
+    #     """Scan and update map"""
+    #     obstacles, free_space = self.radar.scan(self.current_pos, self.env)
+    #
+    #     # Update all scanned cells as "explored"
+    #     all_scanned = obstacles | free_space
+    #     for y, x in all_scanned:
+    #         cell = self._get_cell_from_pos(y, x)
+    #         if not cell.is_explored:
+    #             cell.is_explored = True
+    #
+    #     # Mark obstacle cells
+    #     for y, x in obstacles:
+    #         cell = self._get_cell_from_pos(y, x)
+    #         cell.is_obstacle = True
+    #
+    #     # Ensure free space cells are not obstacles
+    #     for y, x in free_space:
+    #         cell = self._get_cell_from_pos(y, x)
+    #         if not cell.is_obstacle:
+    #             cell.is_obstacle = False
+
     def _scan_and_update(self):
-        """Scan and update map"""
-        obstacles, free_space = self.radar.scan(self.current_pos, self.env)
+        """直接基于真实环境更新单元格障碍，跳过雷达模拟的不完整扫描"""
+        # 遍历所有单元格，直接读取真实环境的障碍状态
+        for row in range(self.grid_rows):
+            for col in range(self.grid_cols):
+                cell = self.grid[row][col]
+                # 取单元格中心像素的真实环境值
+                cy, cx = int(cell.center_y), int(cell.center_x)
+                if 0 <= cy < self.env.height and 0 <= cx < self.env.width:
+                    # 标记为已探索
+                    cell.is_explored = True
+                    # 真实环境中该像素是障碍（static_grid>0.3）→ 单元格设为障碍
+                    if self.env.static_grid[cy, cx] > 0.3:
+                        cell.is_obstacle = True
+                    else:
+                        cell.is_obstacle = False
 
-        # Update all scanned cells as "explored"
-        all_scanned = obstacles | free_space
-        for y, x in all_scanned:
-            cell = self._get_cell_from_pos(y, x)
-            if not cell.is_explored:
-                cell.is_explored = True
-
-        # Mark obstacle cells
-        for y, x in obstacles:
-            cell = self._get_cell_from_pos(y, x)
-            cell.is_obstacle = True
-
-        # Ensure free space cells are not obstacles
-        for y, x in free_space:
-            cell = self._get_cell_from_pos(y, x)
-            if not cell.is_obstacle:
-                cell.is_obstacle = False
 
     def _compute_distance_field(self):
         """Compute distance field to nearest uncovered cell"""
@@ -878,8 +898,8 @@ class UnknownMapVisualizer:
         self._plot_known_map(self.ax2, "known map and searching path")
 
         # 初始化动画元素
-        self.robot_pos1, = self.ax1.plot([], [], 'ro', markersize=10, alpha=0.9, zorder=5, label='robot')
-        self.robot_pos2, = self.ax2.plot([], [], 'ro', markersize=10, alpha=0.9, zorder=5, label='robot')
+        self.robot_pos1, = self.ax1.plot([], [], 'ro', markersize=15, alpha=0.9, zorder=5, label='robot')
+        self.robot_pos2, = self.ax2.plot([], [], 'ro', markersize=15, alpha=0.9, zorder=5, label='robot')
 
         self.path_line1, = self.ax1.plot([], [], 'b-', linewidth=2, alpha=0.7, zorder=3, label='raw path')
         self.path_line2, = self.ax2.plot([], [], 'b-', linewidth=2, alpha=0.7, zorder=3, label='raw path')
@@ -975,12 +995,13 @@ class UnknownMapVisualizer:
                 x_start = max(0, min(x_start, self.env.width - 1))
                 x_end = max(0, min(x_end, self.env.width - 1))
 
-                if cell.is_covered:
-                    # 绿色：已覆盖
-                    self.known_map[y_start:y_end, x_start:x_end] = [0.8, 1.0, 0.8]
-                elif cell.is_explored and cell.is_obstacle:
+
+                if cell.is_explored and cell.is_obstacle:
                     # 黑色：障碍物
                     self.known_map[y_start:y_end, x_start:x_end] = [0.1, 0.1, 0.1]
+                elif cell.is_covered:
+                    # 绿色：已覆盖
+                    self.known_map[y_start:y_end, x_start:x_end] = [0.8, 1.0, 0.8]
 
         ax.imshow(self.known_map, extent=[0, self.env.width, 0, self.env.height],
                   origin='lower', alpha=0.9, zorder=0)
@@ -1105,11 +1126,22 @@ class UnknownMapVisualizer:
                 # 生成网格坐标（y为行，x为列）
                 y_grid, x_grid = np.mgrid[0:self.env.height, 0:self.env.width]
                 radar_range = self.planner.radar.max_range + 0.5
+
+                # 创建总的雷达掩码
+                total_radar_mask = np.zeros((self.env.height, self.env.width), dtype=bool)
+
                 # 雷达扫过区域显示为已知地图
                 for (hx, hy) in self.radar_history:
                     distance = np.sqrt((y_grid - hy) ** 2 + (x_grid - hx) ** 2)
                     radar_mask = distance <= radar_range
                     unknown_map_rgba[radar_mask, 3] = 0
+                    total_radar_mask = total_radar_mask | radar_mask  # 合并所有雷达扫描区域
+
+                # 计算灰色区域（未扫描区域）的比例
+                total_cells = self.env.height * self.env.width
+                scanned_cells = np.sum(total_radar_mask)
+                unscanned_cells = total_cells - scanned_cells
+                scanned_ratio = 1.0 - unscanned_cells / total_cells
 
                 self.ax2.imshow(
                     unknown_map_rgba,
@@ -1119,7 +1151,7 @@ class UnknownMapVisualizer:
                 )
 
                 # 重新创建右侧动态元素
-                self.robot_pos2, = self.ax2.plot([x_pos], [y_pos], 'ro', markersize=10, alpha=0.9, zorder=5)
+                self.robot_pos2, = self.ax2.plot([x_pos], [y_pos], 'ro', markersize=15, alpha=0.9, zorder=5)
 
                 if show_smooth_path and smooth_path_x and smooth_path_y:
                     if frame < len(self.planner.smooth_path):
@@ -1141,10 +1173,10 @@ class UnknownMapVisualizer:
                 )
                 self.ax2.add_patch(self.radar_circle2)
                 self._plot_known_map(self.ax2,
-                                     f"known map (process: {(frame + 1) / len(self.planner.path) * 100:.1f}%)")
+                                     f"known map (process: {scanned_ratio * 100:.1f}%)")
 
-            progress = (frame + 1) / len(self.planner.path) * 100
-            self.ax1.set_title(f'True_Env (Process: {progress:.1f}%)', fontsize=12, fontweight='bold')
+                progress = (frame + 1) / len(self.planner.path) * 100
+                self.ax1.set_title(f'True_Env (Process: {scanned_ratio * 100:.1f}%)', fontsize=12, fontweight='bold')
 
             return (self.robot_pos1, self.robot_pos2,
                     self.smooth_path_line1, self.smooth_path_line2,

@@ -1,4 +1,4 @@
-# Learning Date : 2025/11/19
+# Learning Date : 2025/12/22
 # Learning Date : 2025/11/10
 # Learning Date : 2025/10/25
 import numpy as np
@@ -13,6 +13,7 @@ from enum import Enum
 from collections import deque
 import heapq
 import math
+from sklearn.cluster import DBSCAN  # 用于将散乱的边界点聚类成区域
 
 # 设置matplotlib后端和样式
 plt.rcParams['figure.facecolor'] = 'white'
@@ -35,7 +36,199 @@ class PathSmoother:
         self.smoothing_factor = smoothing_factor
         self.smooth_points_density = smooth_points_density
 
-    def smooth_path_b_spline(self, path, s=0.0):
+    def _calculate_curvature(self, path):
+        """
+        计算路径上每个点的曲率
+        Args:
+            path: 路径点列表 [(y1, x1), (y2, x2), ...]
+        Returns:
+            curvature: 每个点的曲率值
+        """
+        if len(path) < 3:
+            return np.zeros(len(path))
+
+        curvature = np.zeros(len(path))
+
+        for i in range(1, len(path) - 1):
+            # 前一个点、当前点、后一个点
+            p0 = np.array(path[i - 1])
+            p1 = np.array(path[i])
+            p2 = np.array(path[i + 1])
+
+            # 计算向量
+            v1 = p1 - p0
+            v2 = p2 - p1
+
+            # 计算角度变化（转弯程度）
+            norm_v1 = np.linalg.norm(v1)
+            norm_v2 = np.linalg.norm(v2)
+
+            if norm_v1 > 0 and norm_v2 > 0:
+                cos_angle = np.dot(v1, v2) / (norm_v1 * norm_v2)
+                # 限制在[-1, 1]范围内，防止浮点误差
+                cos_angle = np.clip(cos_angle, -1.0, 1.0)
+                # 角度变化（弧度）
+                angle_change = np.arccos(cos_angle)
+                curvature[i] = angle_change
+
+        # 首尾点复制相邻点的曲率
+        if len(path) > 1:
+            curvature[0] = curvature[1]
+            curvature[-1] = curvature[-2]
+
+        return curvature
+
+    def _detect_turn_regions(self, path, curvature_threshold=0.3):
+        """
+        检测转弯区域
+        Args:
+            path: 路径点
+            curvature_threshold: 曲率阈值，大于此值被认为是转弯
+        Returns:
+            turn_regions: 转弯区域的索引列表 [(start1, end1), (start2, end2), ...]
+        """
+        curvature = self._calculate_curvature(path)
+
+        turn_regions = []
+        in_turn = False
+        start_idx = 0
+
+        # 添加扩展区域，确保平滑过渡
+        extend_len = 2  # 在转弯区域前后扩展的点数
+
+        for i in range(len(path)):
+            if curvature[i] > curvature_threshold and not in_turn:
+                in_turn = True
+                start_idx = max(0, i - extend_len)
+            elif curvature[i] <= curvature_threshold and in_turn:
+                in_turn = False
+                end_idx = min(len(path), i + extend_len)
+                if end_idx - start_idx >= 4:  # 至少需要4个点才能进行B样条
+                    turn_regions.append((start_idx, end_idx))
+
+        # 处理最后一个区域
+        if in_turn:
+            end_idx = min(len(path), len(path) + extend_len)
+            if end_idx - start_idx >= 4:
+                turn_regions.append((start_idx, end_idx))
+
+        # 合并重叠的区域
+        if turn_regions:
+            merged_regions = []
+            current_start, current_end = turn_regions[0]
+
+            for start, end in turn_regions[1:]:
+                if start <= current_end:  # 重叠
+                    current_end = max(current_end, end)
+                else:
+                    merged_regions.append((current_start, current_end))
+                    current_start, current_end = start, end
+
+            merged_regions.append((current_start, current_end))
+            turn_regions = merged_regions
+
+        return turn_regions
+
+    def smooth_path_selective(self, path, s=0.3, curvature_threshold=0.3):
+        """
+        选择性平滑路径：只在转弯区域使用B样条，直线区域保持原样或轻微平滑
+        Args:
+            path: 原始路径点列表
+            s: B样条平滑因子
+            curvature_threshold: 曲率阈值，决定什么是转弯
+        Returns:
+            smoothed_path: 平滑后的路径
+        """
+        if len(path) < 4:
+            return self.smooth_path_simple(path)  # 点太少，使用简单平滑
+
+        # 检测转弯区域
+        turn_regions = self._detect_turn_regions(path, curvature_threshold)
+
+        if not turn_regions:
+            print(f"   - 未检测到明显转弯，使用简单平滑")
+            return self.smooth_path_simple(path, window_size=3)
+
+        # 创建结果路径副本
+        smoothed_path = path.copy()
+
+        # 对每个转弯区域进行B样条平滑
+        for region_idx, (start, end) in enumerate(turn_regions):
+            print(f"   - 平滑转弯区域 {region_idx + 1}: 点 {start}-{end} ({end - start}个点)")
+
+            # 提取转弯区域
+            turn_region = path[start:end]
+
+            if len(turn_region) >= 4:
+                # 对转弯区域进行B样条平滑
+                smoothed_region = self.smooth_path_b_spline(turn_region, s)
+
+                # 将平滑后的区域替换回原路径
+                # 保留首尾点以保持连接平滑
+                if start > 0 and end < len(path):
+                    # 内部区域：保留第一个和最后一个点
+                    smoothed_path[start + 1:end - 1] = smoothed_region[1:-1]
+                elif start == 0:
+                    # 起始区域：保留最后一个点
+                    smoothed_path[start:end - 1] = smoothed_region[:-1]
+                elif end == len(path):
+                    # 结束区域：保留第一个点
+                    smoothed_path[start + 1:end] = smoothed_region[1:]
+
+        # 对整个路径进行轻微的整体平滑，确保过渡自然
+        final_path = self._blend_smooth_regions(smoothed_path, turn_regions)
+
+        print(f"   - 选择性平滑完成: {len(path)} → {len(final_path)} 个点")
+        print(f"   - 检测到 {len(turn_regions)} 个转弯区域")
+        return final_path
+
+    def _blend_smooth_regions(self, path, turn_regions, blend_window=3):
+        """
+        混合平滑区域，确保过渡自然
+        Args:
+            path: 路径
+            turn_regions: 转弯区域
+            blend_window: 混合窗口大小
+        Returns:
+            blended_path: 混合后的路径
+        """
+        if not turn_regions or len(path) < blend_window * 2:
+            return path
+
+        blended_path = list(path)  # 转换为列表以便修改
+
+        # 对每个转弯区域的边界进行混合
+        for start, end in turn_regions:
+            # 混合起始边界
+            if start > 0:
+                blend_start = max(0, start - blend_window)
+                for i in range(blend_start, start):
+                    if i < len(blended_path) - 1:
+                        alpha = (i - blend_start) / (start - blend_start)
+                        # 线性混合
+                        y1, x1 = blended_path[i]
+                        y2, x2 = path[i]
+                        blended_path[i] = (
+                            y1 * alpha + y2 * (1 - alpha),
+                            x1 * alpha + x2 * (1 - alpha)
+                        )
+
+            # 混合结束边界
+            if end < len(path):
+                blend_end = min(len(path), end + blend_window)
+                for i in range(end, blend_end):
+                    if i < len(blended_path):
+                        alpha = (i - end) / (blend_end - end)
+                        y1, x1 = blended_path[i]
+                        y2, x2 = path[i]
+                        blended_path[i] = (
+                            y1 * (1 - alpha) + y2 * alpha,
+                            x1 * (1 - alpha) + x2 * alpha
+                        )
+
+        return blended_path
+
+    def smooth_path_b_spline(self, path, s=0.3):
         """
         使用B样条曲线平滑路径
         Args:
@@ -57,7 +250,7 @@ class PathSmoother:
             tck, u = splprep([x_coords, y_coords], s=s, per=False)
 
             # 生成更密集的插值点
-            num_points = max(50, int(len(path) * self.smooth_points_density))
+            num_points = max(15, int(len(path) * self.smooth_points_density))
             u_new = np.linspace(0, 1, num_points)
 
             # 计算平滑后的路径
@@ -66,7 +259,6 @@ class PathSmoother:
             # 重新组合为(y, x)格式
             smoothed_path = list(zip(y_smooth, x_smooth))
 
-            print(f"   - 路径平滑: {len(path)} → {len(smoothed_path)} 个点")
             return smoothed_path
 
         except Exception as e:
@@ -97,8 +289,9 @@ class PathSmoother:
 
             smoothed_path.append((avg_y, avg_x))
 
-        print(f"   - 简单平滑: 窗口大小 {window_size}")
         return smoothed_path
+
+
 
 
 class ForestEnvironmentVisualizer:
@@ -475,391 +668,370 @@ class GridCell:
         self.distance_to_uncovered = float('inf')
 
 
-class ImprovedWavefrontPlanner:
-    """Improved wavefront coverage planner"""
+class AStarSolver:
+    """改进后的 A* 算法：处理空心障碍物并支持软膨胀"""
 
-    def __init__(self, environment, radar_range=10, cell_size=2):
-        self.env = environment
-        self.height = environment.height
-        self.width = environment.width
-        self.radar_range = radar_range
-        self.cell_size = cell_size
+    def __init__(self, rows, cols, robot_radius=2):
+        self.rows = rows
+        self.cols = cols
+        self.robot_radius = robot_radius  # 安全避障半径
 
-        # Grid parameters
-        self.grid_rows = int(np.ceil(self.height / self.cell_size))
-        self.grid_cols = int(np.ceil(self.width / self.cell_size))
-        self.min_turning_radius = 2.0  # 最小转弯半径
-        print(f"\nGrid Info:")
-        print(f"   - Map size: {self.height} x {self.width} m")
-        print(f"   - Cell size: {self.cell_size} x {self.cell_size} m")
-        print(f"   - Grid dimensions: {self.grid_rows} x {self.grid_cols} = {self.grid_rows * self.grid_cols} cells")
+    def heuristic(self, a, b):
+        return np.sqrt((a[0] - b[0]) ** 2 + (a[1] - b[1]) ** 2)
 
-        # Initialize grid
-        self.grid = [[None for _ in range(self.grid_cols)] for _ in range(self.grid_rows)]
-        for row in range(self.grid_rows):
-            for col in range(self.grid_cols):
-                center_y = (row + 0.5) * self.cell_size
-                center_x = (col + 0.5) * self.cell_size
-                if center_y >= self.height:
-                    center_y = self.height - 0.5
-                if center_x >= self.width:
-                    center_x = self.width - 0.5
-                self.grid[row][col] = GridCell(row, col, center_y, center_x, self.cell_size)
+    def get_cell_cost(self, node, grid_map):
+        """
+        计算进入该格子的总代价
+        """
+        r, c = node
+        cell_status = grid_map[r, c]
 
-        # Radar
-        self.radar = RadarSensor(max_range=radar_range)
+        # 1. 绝对障碍物：返回极大值
+        if cell_status == 2:
+            return float('inf')
 
-        # Path smoother
-        self.path_smoother = PathSmoother(smoothing_factor=0.1, smooth_points_density=2.0)
+        # 2. 基础代价
+        # status 1 (Free) = 1.0
+        # status 0 (Unknown) = 10.0 (惩罚项，防止钻进空心的障碍物内部)
+        base_cost = 1.0 if cell_status == 1 else 10.0
 
-        # Start position
-        start_y, start_x = environment.start_pos
-        self.current_cell = self._get_cell_from_pos(start_y, start_x)
-        self.current_pos = (int(self.current_cell.center_y), int(self.current_cell.center_x))
+        # 3. 软膨胀代价 (靠近障碍物的惩罚)
+        inflation_penalty = 0
+        if self.robot_radius > 0:
+            margin = int(self.robot_radius)
+            # 检查周围的一个小窗口
+            r_min, r_max = max(0, r - margin), min(self.rows, r + margin + 1)
+            c_min, c_max = max(0, c - margin), min(self.cols, c + margin + 1)
 
-        # Path record
-        self.raw_path = [self.current_pos]  # 原始路径
-        self.smooth_path = []  # 平滑后的路径
-        self.path = self.raw_path  # 当前使用的路径
-        self.use_astar = False
+            region = grid_map[r_min:r_max, c_min:c_max]
+            if np.any(region == 2):
+                # 附近有障碍物，增加额外代价，离得越近代价越高（这里简化为固定惩罚）
+                inflation_penalty = 15.0
 
-        # Initial scan
-        self._scan_and_update()
-        self.current_cell.is_covered = True
-        self.current_cell.visit_count = 1
+        return base_cost + inflation_penalty
 
-        print(f"   - Start: Cell({self.current_cell.row}, {self.current_cell.col})")
-        print(f"   - Radar range: {self.radar_range} m")
+    def plan(self, start, goal, grid_map):
+        start = tuple(map(int, start))
+        goal = tuple(map(int, goal))
 
-    def _get_cell_from_pos(self, y, x):
-        """Get cell from position"""
-        row = min(int(y / self.cell_size), self.grid_rows - 1)
-        col = min(int(x / self.cell_size), self.grid_cols - 1)
-        return self.grid[row][col]
+        if not (0 <= goal[0] < self.rows and 0 <= goal[1] < self.cols):
+            return []
 
-    def _scan_and_update(self):
-        """Scan and update map"""
-        obstacles, free_space = self.radar.scan(self.current_pos, self.env)
-
-        # Update all scanned cells as "explored"
-        all_scanned = obstacles | free_space
-        for y, x in all_scanned:
-            cell = self._get_cell_from_pos(y, x)
-            if not cell.is_explored:
-                cell.is_explored = True
-
-        # Mark obstacle cells
-        for y, x in obstacles:
-            cell = self._get_cell_from_pos(y, x)
-            cell.is_obstacle = True
-
-        # Ensure free space cells are not obstacles
-        for y, x in free_space:
-            cell = self._get_cell_from_pos(y, x)
-            if not cell.is_obstacle:
-                cell.is_obstacle = False
-
-    def _compute_distance_field(self):
-        """Compute distance field to nearest uncovered cell"""
-        # Reset distances
-        for row in range(self.grid_rows):
-            for col in range(self.grid_cols):
-                self.grid[row][col].distance_to_uncovered = float('inf')
-
-        # Find all uncovered passable cells as seeds
-        queue = deque()
-        for row in range(self.grid_rows):
-            for col in range(self.grid_cols):
-                cell = self.grid[row][col]
-                # Explored, passable, uncovered cells as seeds
-                if cell.is_explored and not cell.is_obstacle and not cell.is_covered:
-                    cell.distance_to_uncovered = 0
-                    queue.append(cell)
-                # Unexplored cells also as potential targets (boundary exploration)
-                elif not cell.is_explored:
-                    cell.distance_to_uncovered = 0
-                    queue.append(cell)
-
-        # BFS to compute distance field
-        while queue:
-            cell = queue.popleft()
-
-            for dr in [-1, 0, 1]:
-                for dc in [-1, 0, 1]:
-                    if dr == 0 and dc == 0:
-                        continue
-
-                    nr, nc = cell.row + dr, cell.col + dc
-                    if not (0 <= nr < self.grid_rows and 0 <= nc < self.grid_cols):
-                        continue
-
-                    neighbor = self.grid[nr][nc]
-
-                    # Skip obstacles
-                    if neighbor.is_explored and neighbor.is_obstacle:
-                        continue
-
-                    # Diagonal distance is 1.414, straight is 1
-                    move_cost = 1.414 if (dr != 0 and dc != 0) else 1.0
-                    new_distance = cell.distance_to_uncovered + move_cost
-
-                    if new_distance < neighbor.distance_to_uncovered:
-                        neighbor.distance_to_uncovered = new_distance
-                        queue.append(neighbor)
-
-    def _get_next_cell_improved(self):
-        """Improved wavefront: select direction guided to uncovered area"""
-        # Compute distance field
-        self._compute_distance_field()
-
-        candidates = []
-
-        # Check 8 neighbors
-        for dr in [-1, 0, 1]:
-            for dc in [-1, 0, 1]:
-                if dr == 0 and dc == 0:
-                    continue
-
-                nr, nc = self.current_cell.row + dr, self.current_cell.col + dc
-                if not (0 <= nr < self.grid_rows and 0 <= nc < self.grid_cols):
-                    continue
-
-                neighbor = self.grid[nr][nc]
-
-                # Skip known obstacles
-                if neighbor.is_explored and neighbor.is_obstacle:
-                    continue
-
-                # Priority calculation
-                if not neighbor.is_covered:
-                    priority = (0, 0, neighbor.visit_count)
-                else:
-                    priority = (1, neighbor.distance_to_uncovered, neighbor.visit_count)
-
-                candidates.append((priority, neighbor))
-
-        if candidates:
-            candidates.sort(key=lambda x: x[0])
-            return candidates[0][1]
-
-        return None
-
-    def _find_nearest_uncovered(self):
-        """BFS to find nearest uncovered cell"""
-        visited = set()
-        queue = deque([self.current_cell])
-        visited.add((self.current_cell.row, self.current_cell.col))
-
-        while queue:
-            cell = queue.popleft()
-
-            for dr in [-1, 0, 1]:
-                for dc in [-1, 0, 1]:
-                    if dr == 0 and dc == 0:
-                        continue
-
-                    nr, nc = cell.row + dr, cell.col + dc
-                    if not (0 <= nr < self.grid_rows and 0 <= nc < self.grid_cols):
-                        continue
-                    if (nr, nc) in visited:
-                        continue
-
-                    neighbor = self.grid[nr][nc]
-                    visited.add((nr, nc))
-
-                    if neighbor.is_explored and neighbor.is_obstacle:
-                        continue
-
-                    if not neighbor.is_covered:
-                        return neighbor
-
-                    queue.append(neighbor)
-
-        return None
-
-    def _astar_plan(self, target_cell):
-        """A* path planning"""
-
-        def reed_shepp_simplified_heuristic(cell1, cell2):
-            """简化的Reeds-Shepp启发式（基于Dubins路径近似）"""
-            dx = cell2.center_x - cell1.center_x
-            dy = cell2.center_y - cell1.center_y
-            straight_distance = math.sqrt(dx * dx + dy * dy)
-
-            # 最小转弯半径
-            min_radius = 2.0
-
-            # 简化的Reeds-Shepp距离估计
-            # 对于网格规划，这通常比欧几里得距离更接近实际车辆运动成本
-            if straight_distance < min_radius:
-                # 短距离时考虑转弯成本
-                return straight_distance * 1.5
-            else:
-                # 长距离时接近直线距离，但稍微增加以考虑可能的转弯
-                return straight_distance * 1.1
+        # 即使目标点在膨胀层内，我们也允许规划（只要不是直接在障碍物上）
+        if grid_map[goal] == 2:
+            return []
 
         open_set = []
-        heapq.heappush(open_set, (0, id(self.current_cell), self.current_cell))
-
+        # (f_score, current_node)
+        heapq.heappush(open_set, (0, start))
         came_from = {}
-        g_score = {(self.current_cell.row, self.current_cell.col): 0}
+        g_score = {start: 0}
+        f_score = {start: self.heuristic(start, goal)}
+
+        neighbors = [(0, 1), (0, -1), (1, 0), (-1, 0), (1, 1), (1, -1), (-1, 1), (-1, -1)]
 
         while open_set:
-            _, _, current = heapq.heappop(open_set)
+            current = heapq.heappop(open_set)[1]
 
-            if current == target_cell:
+            if current == goal:
                 path = []
-                while (current.row, current.col) in came_from:
+                while current in came_from:
                     path.append(current)
-                    current = came_from[(current.row, current.col)]
-                path.reverse()
-                return path
+                    current = came_from[current]
+                path.append(start)
+                return path[::-1]
 
-            current_pos = (current.row, current.col)
+            for dy, dx in neighbors:
+                neighbor = (current[0] + dy, current[1] + dx)
 
-            for dr in [-1, 0, 1]:
-                for dc in [-1, 0, 1]:
-                    if dr == 0 and dc == 0:
-                        continue
+                if not (0 <= neighbor[0] < self.rows and 0 <= neighbor[1] < self.cols):
+                    continue
 
-                    nr, nc = current.row + dr, current.col + dc
-                    if not (0 <= nr < self.grid_rows and 0 <= nc < self.grid_cols):
-                        continue
+                # 计算这一步的移动权重
+                step_cost = self.get_cell_cost(neighbor, grid_map)
 
-                    neighbor = self.grid[nr][nc]
+                # 如果是绝对碰撞，跳过
+                if step_cost == float('inf'):
+                    continue
 
-                    if neighbor != target_cell:
-                        if neighbor.is_explored and neighbor.is_obstacle:
-                            continue
+                # 基础移动代价（欧几里得距离）
+                move_dist = 1.414 if abs(dy) + abs(dx) == 2 else 1.0
 
-                    move_cost = 1.414 if (dr != 0 and dc != 0) else 1.0
-                    tentative_g = g_score[current_pos] + move_cost
+                # 总代价 = 当前G + 距离 * 该格子的危险权重
+                tentative_g_score = g_score[current] + move_dist * step_cost
 
-                    neighbor_pos = (nr, nc)
-                    if neighbor_pos not in g_score or tentative_g < g_score[neighbor_pos]:
-                        came_from[neighbor_pos] = current
-                        g_score[neighbor_pos] = tentative_g
-                        f_score = tentative_g + reed_shepp_simplified_heuristic(neighbor, target_cell)
-                        heapq.heappush(open_set, (f_score, id(neighbor), neighbor))
+                if neighbor not in g_score or tentative_g_score < g_score[neighbor]:
+                    came_from[neighbor] = current
+                    g_score[neighbor] = tentative_g_score
+                    f_score[neighbor] = tentative_g_score + self.heuristic(neighbor, goal)
+                    heapq.heappush(open_set, (f_score[neighbor], neighbor))
 
         return []
 
-    def step(self):
-        """Execute one step"""
-        # Scan and update map
-        self._scan_and_update()
 
-        # Select next step
-        next_cell = self._get_next_cell_improved()
-        self.use_astar = False
-
-        if next_cell is None:
-            # Dead end, activate A*
-            self.use_astar = True
-            target = self._find_nearest_uncovered()
-
-            if target is None:
-                return False
-
-            path = self._astar_plan(target)
-            if not path:
-                return False
-
-            next_cell = path[0]
-
-        if next_cell is None:
-            return False
-
-        # Move to next cell
-        self.current_cell = next_cell
-        self.current_pos = (int(next_cell.center_y), int(next_cell.center_x))
-        self.raw_path.append(self.current_pos)
-
-        next_cell.is_covered = True
-        next_cell.visit_count += 1
-
-        return True
-
-    def smooth_final_path(self, method='b_spline'):
+class FALCONPlanner:
+    def __init__(self, environment, radar_range=8, cell_size=1):
         """
-        平滑最终路径
-        Args:
-            method: 平滑方法 'b_spline' 或 'simple'
+        初始化 FALCON 规划器
         """
-        print(f"\n开始路径平滑...")
-        print(f"   - 原始路径点数: {len(self.raw_path)}")
+        self.env = environment
+        self.grid_rows = environment.height
+        self.grid_cols = environment.width
+        self.cell_size = cell_size
 
-        if method == 'b_spline':
-            self.smooth_path = self.path_smoother.smooth_path_b_spline(self.raw_path, s=0.1)
-        else:
-            self.smooth_path = self.path_smoother.smooth_path_simple(self.raw_path, window_size=3)
+        # 1. 初始化雷达
+        self.radar = RadarSensor(max_range=radar_range)
 
-        # 更新当前使用的路径为平滑后的路径
-        self.path = self.smooth_path
-        print(f"   - 平滑后路径点数: {len(self.smooth_path)}")
+        # 2. 初始化双重地图表示
+        # (a) 给可视化用的 GridCell 对象列表
+        self.grid = [[GridCell(r, c, r, c, cell_size)
+                      for c in range(self.grid_cols)]
+                     for r in range(self.grid_rows)]
 
-    def run_coverage(self, max_steps=5000, target_coverage=0.95, enable_smoothing=True):
-        """Run coverage planning"""
-        print(f"\nStart coverage planning...")
-        print(f"   Strategy: Improved Wavefront (distance field guided) + A* backtrack")
+        # (b) 给算法用的 Numpy 数组 (0: Unknown, 1: Free, 2: Obstacle)
+        # 初始化全为 0 (Unknown)
+        self.np_grid = np.zeros((self.grid_rows, self.grid_cols), dtype=int)
 
-        step = 0
-        while step < max_steps:
-            if not self.step():
-                print(f"   Cannot continue planning")
+        # 3. 初始化工具
+        self.a_star = AStarSolver(self.grid_rows, self.grid_cols, robot_radius=1.5)
+        self.smoother = PathSmoother()
+        self.vals = {'unknown': 0, 'free': 1, 'obs': 2}
+
+        # FALCON 参数
+        self.cluster_eps = 5.0
+        self.cluster_min_samples = 3
+
+        # 路径记录
+        self.path = []  # 历史走过的所有点 (用于动画)
+        self.smooth_path = []  # 当前规划的平滑路径
+        self.current_pos = tuple(map(int, environment.start_pos))
+
+        # 初始状态
+        self.path.append(self.current_pos)
+        self._update_map_at(self.current_pos[0], self.current_pos[1], status='free')
+
+    def _update_map_at(self, r, c, status):
+        """同时更新 GridCell 和 NumpyGrid"""
+        if not (0 <= r < self.grid_rows and 0 <= c < self.grid_cols):
+            return
+
+        # 更新 GridCell (可视化用)
+        cell = self.grid[r][c]
+        cell.is_explored = True
+
+        # 更新 NumpyGrid (算法用)
+        if status == 'obs':
+            cell.is_obstacle = True
+            self.np_grid[r, c] = self.vals['obs']
+        elif status == 'free':
+            cell.is_obstacle = False
+            # 只有当原本不是障碍物时才标记为 Free (避免覆盖)
+            if self.np_grid[r, c] != self.vals['obs']:
+                self.np_grid[r, c] = self.vals['free']
+
+        # 标记覆盖 (对于覆盖率统计)
+        cell.is_covered = True
+
+    def _perform_scan(self):
+        """执行雷达扫描并更新地图"""
+        obs, free = self.radar.scan(self.current_pos, self.env)
+
+        for (r, c) in free:
+            self._update_map_at(r, c, 'free')
+
+        for (r, c) in obs:
+            self._update_map_at(r, c, 'obs')
+
+    def _get_frontiers(self):
+        """FALCON: 提取边界点 (numpy 优化版)"""
+        # 只有 Free 的点才有资格作为边界的 "这一侧"
+        free_mask = (self.np_grid == self.vals['free'])
+
+        # 定义卷积核查找 4 邻域内的 Unknown
+        # 这里用简单的切片操作代替卷积以减少依赖
+        # 边界点定义：本身是 Free，且上下左右至少有一个是 Unknown
+
+        rows, cols = self.np_grid.shape
+        frontiers = []
+
+        # 获取所有 Free 点的坐标
+        free_indices = np.argwhere(free_mask)
+
+        if len(free_indices) == 0:
+            return np.array([])
+
+        # 遍历 Free 点 (量大时可优化，但对于 100x100 地图尚可)
+        for r, c in free_indices:
+            is_frontier = False
+            for dr, dc in [(-1, 0), (1, 0), (0, -1), (0, 1)]:
+                nr, nc = r + dr, c + dc
+                if 0 <= nr < rows and 0 <= nc < cols:
+                    if self.np_grid[nr, nc] == self.vals['unknown']:
+                        is_frontier = True
+                        break
+            if is_frontier:
+                frontiers.append((r, c))
+
+        return np.array(frontiers)
+
+    def _decompose_and_cluster(self, frontiers):
+        """FALCON: 空间聚类 (DBSCAN)"""
+        if len(frontiers) == 0:
+            return []
+
+        # 调用 DBSCAN
+        try:
+            clustering = DBSCAN(eps=self.cluster_eps, min_samples=self.cluster_min_samples).fit(frontiers)
+        except Exception:
+            return []  # 异常处理
+
+        labels = clustering.labels_
+        zones = []
+        unique_labels = set(labels)
+
+        for label in unique_labels:
+            if label == -1: continue  # 噪声点忽略
+
+            points = frontiers[labels == label]
+            if len(points) == 0: continue
+
+            centroid = np.mean(points, axis=0).astype(int)
+            zones.append({
+                'id': label,
+                'centroid': tuple(centroid),
+                'points': points,
+                'score': len(points)  # 区域大小作为评分
+            })
+
+        return zones
+
+    def _solve_global_goal(self, zones):
+        """FALCON: 全局目标选择 (Greedy ATSP)"""
+        if not zones: return None
+
+        best_zone = None
+        min_cost = float('inf')
+
+        for zone in zones:
+            dist = np.sqrt((zone['centroid'][0] - self.current_pos[0]) ** 2 +
+                           (zone['centroid'][1] - self.current_pos[1]) ** 2)
+
+            # 代价函数：距离越短越好，区域包含的边界点越多越好
+            cost = dist / (zone['score'] + 0.1)
+
+            if cost < min_cost:
+                min_cost = cost
+                best_zone = zone
+
+        return best_zone
+
+    def _solve_local_path(self, target_zone):
+        """FALCON: 局部优化与寻路"""
+        # 从 Zone 中选择一个最佳进入点 (离机器人最近的点)
+        candidate_points = target_zone['points']
+
+        # 简单的最近邻
+        dists = np.linalg.norm(candidate_points - np.array(self.current_pos), axis=1)
+        best_idx = np.argmin(dists)
+        target_pt = tuple(candidate_points[best_idx])
+
+        # A* 寻路
+        path = self.a_star.plan(self.current_pos, target_pt, self.np_grid)
+        return path
+
+    def run_coverage(self, max_steps=2000, target_coverage=0.98, enable_smoothing=True):
+        """
+        [主接口] 执行完整的覆盖探测循环
+        """
+        print("🚀 开始 FALCON 覆盖路径规划...")
+        steps = 0
+
+        while steps < max_steps:
+            # 1. 扫描环境
+            self._perform_scan()
+
+            # 2. 检查覆盖率 (可选，这里简化逻辑)
+            # if coverage > target: break
+            # 计算已探索（非 0）的格子数量
+            total_cells = self.grid_rows * self.grid_cols
+            explored_count = np.sum(self.np_grid != self.vals['unknown'])
+            current_coverage = explored_count / total_cells
+
+            if current_coverage >= target_coverage:
+                print(f"🎯 已达到目标覆盖率 ({current_coverage * 100:.2f}%)，停止探索。")
                 break
 
-            step += 1
+            # 3. 规划逻辑
+            # 获取边界
+            frontiers = self._get_frontiers()
 
-            # Statistics
-            if step % 100 == 0:
-                explored = sum(1 for r in range(self.grid_rows) for c in range(self.grid_cols)
-                               if self.grid[r][c].is_explored and not self.grid[r][c].is_obstacle)
-                covered = sum(1 for r in range(self.grid_rows) for c in range(self.grid_cols)
-                              if self.grid[r][c].is_covered)
-                total_visits = sum(self.grid[r][c].visit_count for r in range(self.grid_rows)
-                                   for c in range(self.grid_cols))
+            if len(frontiers) < 4:
+                print("✅ 没有更多边界，探索完成。")
+                break
 
-                coverage = covered / explored if explored > 0 else 0
-                repeat = (total_visits - covered) / total_visits if total_visits > 0 else 0
+            # 空间聚类
+            zones = self._decompose_and_cluster(frontiers)
 
-                print(f"   Steps: {step}, Explored: {explored}, Covered: {covered}, "
-                      f"Coverage: {coverage * 100:.1f}%, Repeat: {repeat * 100:.1f}%")
+            current_plan_path = []
 
-            # Check if target coverage reached
-            if step % 50 == 0:
-                explored = sum(1 for r in range(self.grid_rows) for c in range(self.grid_cols)
-                               if self.grid[r][c].is_explored and not self.grid[r][c].is_obstacle)
-                covered = sum(1 for r in range(self.grid_rows) for c in range(self.grid_cols)
-                              if self.grid[r][c].is_covered)
-                coverage = covered / explored if explored > 0 else 0
+            if not zones:
+                # Fallback: 如果聚类失败(点太散)，直接去最近的边界点
+                dists = np.linalg.norm(frontiers - np.array(self.current_pos), axis=1)
+                nearest_pt = tuple(frontiers[np.argmin(dists)])
+                current_plan_path = self.a_star.plan(self.current_pos, nearest_pt, self.np_grid)
+            else:
+                # 全局规划 + 局部规划
+                target_zone = self._solve_global_goal(zones)
+                if target_zone:
+                    current_plan_path = self._solve_local_path(target_zone)
 
-                if coverage >= target_coverage:
-                    print(f"\nTarget coverage {target_coverage * 100:.1f}% reached!")
-                    break
+            # 4. 执行移动 (如果规划出路径)
+            if not current_plan_path:
+                print("⚠️ 无法规划路径，尝试随机移动摆脱困境...")
+                # 简单的随机游走策略
+                attempts = 0
+                moved = False
+                while attempts < 10:
+                    rr = self.current_pos[0] + random.randint(-2, 2)
+                    cc = self.current_pos[1] + random.randint(-2, 2)
+                    if (0 <= rr < self.grid_rows and 0 <= cc < self.grid_cols and
+                            self.np_grid[rr, cc] != self.vals['obs']):
+                        path_seg = self.a_star.plan(self.current_pos, (rr, cc), self.np_grid)
+                        if path_seg:
+                            current_plan_path = path_seg
+                            moved = True
+                            break
+                    attempts += 1
+                if not moved:
+                    break  # 彻底卡死
 
-        # Final statistics
-        explored = sum(1 for r in range(self.grid_rows) for c in range(self.grid_cols)
-                       if self.grid[r][c].is_explored and not self.grid[r][c].is_obstacle)
-        covered = sum(1 for r in range(self.grid_rows) for c in range(self.grid_cols)
-                      if self.grid[r][c].is_covered)
-        total_visits = sum(self.grid[r][c].visit_count for r in range(self.grid_rows)
-                           for c in range(self.grid_cols))
+            # 5. 记录与平滑
+            if current_plan_path:
+                # 为了动画效果，我们只走路径的一小段，然后重新扫描 (Receding Horizon)
+                # 这样可以模拟实时发现障碍物
+                step_size = min(len(current_plan_path), 5)  # 每次规划只走前5步
+                execute_path = current_plan_path[:step_size]
 
-        coverage = covered / explored if explored > 0 else 0
-        repeat = (total_visits - covered) / total_visits if total_visits > 0 else 0
+                for pt in execute_path:
+                    self.current_pos = pt
+                    self.path.append(pt)
+                    # 每一步都需要扫描，确保遇到动态障碍物能停下(简单模拟)
+                    self._perform_scan()
+                    steps += 1
 
-        print(f"\nPlanning complete:")
-        print(f"   - Total steps: {len(self.raw_path)}")
-        print(f"   - Explored cells: {explored}")
-        print(f"   - Covered cells: {covered}")
-        print(f"   - Coverage rate: {coverage * 100:.2f}%")
-        print(f"   - Repeat rate: {repeat * 100:.2f}%")
+                # 存储当前的完整规划路径用于可视化展示 (平滑)
+                if enable_smoothing:
+                    self.smooth_path.extend(self.smoother.smooth_path_simple(execute_path))
+                else:
+                    self.smooth_path.extend(execute_path)
+            else:
+                break
 
-        # 路径平滑
-        if enable_smoothing and len(self.raw_path) > 10:
-            self.smooth_final_path(method='b_spline')
+            if steps % 100 == 0:
+                print(f"Step {steps}: Frontiers={len(frontiers)}, Zones={len(zones)}")
 
+        print(f"🏁 探索结束，总步数: {steps}\n")
+        print(f"总平滑步数: {len(self.smooth_path)}")
 
 class UnknownMapVisualizer:
     """未知环境路径规划可视化器"""
@@ -895,11 +1067,11 @@ class UnknownMapVisualizer:
         self._plot_known_map(self.ax2, "known map and searching path")
 
         # 初始化动画元素
-        self.robot_pos1, = self.ax1.plot([], [], 'ro', markersize=10, alpha=0.9, zorder=5, label='robot')
-        self.robot_pos2, = self.ax2.plot([], [], 'ro', markersize=10, alpha=0.9, zorder=5, label='robot')
+        self.robot_pos1, = self.ax1.plot([], [], 'ro', markersize=15, alpha=0.9, zorder=5, label='robot')
+        self.robot_pos2, = self.ax2.plot([], [], 'ro', markersize=15, alpha=0.9, zorder=5, label='robot')
 
-        self.path_line1, = self.ax1.plot([], [], 'b-', linewidth=2, alpha=0.7, zorder=3, label='raw path')
-        self.path_line2, = self.ax2.plot([], [], 'b-', linewidth=2, alpha=0.7, zorder=3, label='raw path')
+        self.path_line1, = self.ax1.plot([], [], 'b-', linewidth=3, alpha=0.8, zorder=3, label='raw path')
+        self.path_line2, = self.ax2.plot([], [], 'b-', linewidth=3, alpha=0.8, zorder=3, label='raw path')
 
         # 平滑路径线（红色）
         self.smooth_path_line1, = self.ax1.plot([], [], 'b-', linewidth=3, alpha=0.8, zorder=3, label='smooth path')
@@ -992,12 +1164,13 @@ class UnknownMapVisualizer:
                 x_start = max(0, min(x_start, self.env.width - 1))
                 x_end = max(0, min(x_end, self.env.width - 1))
 
-                if cell.is_covered:
-                    # 绿色：已覆盖
-                    self.known_map[y_start:y_end, x_start:x_end] = [0.8, 1.0, 0.8]
-                elif cell.is_explored and cell.is_obstacle:
+
+                if cell.is_explored and cell.is_obstacle:
                     # 黑色：障碍物
                     self.known_map[y_start:y_end, x_start:x_end] = [0.1, 0.1, 0.1]
+                elif cell.is_covered:
+                    # 绿色：已覆盖
+                    self.known_map[y_start:y_end, x_start:x_end] = [0.8, 1.0, 0.8]
 
         ax.imshow(self.known_map, extent=[0, self.env.width, 0, self.env.height],
                   origin='lower', alpha=0.9, zorder=0)
@@ -1067,51 +1240,58 @@ class UnknownMapVisualizer:
                     self.radar_circle1, self.radar_circle2)
 
         def update(frame):
-            if frame >= len(self.planner.path):
+            if frame >= len(self.planner.smooth_path):
                 return (self.robot_pos1, self.robot_pos2,
                         self.smooth_path_line1, self.smooth_path_line2,
                         self.radar_circle1, self.radar_circle2)
 
-            current_pos = self.planner.path[frame]
+            current_pos = self.planner.smooth_path[frame]
             x_pos = current_pos[1]
             y_pos = current_pos[0]
 
             # 更新机器人位置
             self.robot_pos1.set_data([x_pos], [y_pos])
-            self.robot_pos2.set_data([x_pos], [y_pos])
+
 
             # 更新雷达范围
             self.radar_circle1.center = (x_pos, y_pos)
-            self.radar_circle2.center = (x_pos, y_pos)
+
 
             self.radar_history.append((x_pos, y_pos))  # 存储当前雷达中心
             # 控制历史记录数量，避免内存占用过大
-            if len(self.radar_history) > 2000:
+            if len(self.radar_history) > 3000:
                 self.radar_history.pop(0)
 
             smooth_path_x = []
             smooth_path_y = []
 
             # 更新原始路径线
+            if frame > 0:
+                smooth_path_x = [p[1] for p in self.planner.smooth_path[:frame + 1]]
+                smooth_path_y = [p[0] for p in self.planner.smooth_path[:frame + 1]]
+                self.path_line1.set_data(smooth_path_x, smooth_path_y)
+                self.path_line2.set_data(smooth_path_x, smooth_path_y)
+
+
 
             # 更新平滑路径线（如果存在且需要显示）
-            if show_smooth_path and hasattr(self.planner, 'smooth_path') and self.planner.smooth_path:
-                # 计算当前帧对应的平滑路径点
-                if frame < len(self.planner.smooth_path):
-                    # 逐步显示平滑路径：从起点到当前帧位置
-                    current_smooth_segment = self.planner.smooth_path[:frame + 1]
-                    smooth_path_x = [p[1] for p in current_smooth_segment]
-                    smooth_path_y = [p[0] for p in current_smooth_segment]
-                else:
-                    # 如果帧数超过平滑路径长度，显示完整路径
-                    smooth_path_x = [p[1] for p in self.planner.smooth_path]
-                    smooth_path_y = [p[0] for p in self.planner.smooth_path]
-
-                self.smooth_path_line1.set_data(smooth_path_x, smooth_path_y)
-                self.smooth_path_line2.set_data(smooth_path_x, smooth_path_y)
+            # if show_smooth_path and hasattr(self.planner, 'smooth_path') and self.planner.smooth_path:
+            #     # 计算当前帧对应的平滑路径点
+            #     if frame < len(self.planner.smooth_path):
+            #         # 逐步显示平滑路径：从起点到当前帧位置
+            #         current_smooth_segment = self.planner.smooth_path[:frame + 1]
+            #         smooth_path_x = [p[1] for p in current_smooth_segment]
+            #         smooth_path_y = [p[0] for p in current_smooth_segment]
+            #     else:
+            #         # 如果帧数超过平滑路径长度，显示完整路径
+            #         smooth_path_x = [p[1] for p in self.planner.smooth_path]
+            #         smooth_path_y = [p[0] for p in self.planner.smooth_path]
+            #
+            #     self.smooth_path_line1.set_data(smooth_path_x, smooth_path_y)
+            #     self.smooth_path_line2.set_data(smooth_path_x, smooth_path_y)
 
             # 更新右侧地图（每5帧更新一次以提高性能）
-            if frame % 5 == 0 or frame == len(self.planner.path) - 1:
+            if frame % 2 == 0 or frame == len(self.planner.smooth_path) - 1:
                 self.ax2.clear()
                 unknown_map = np.ones((self.env.height, self.env.width, 3)) * 0.8
                 # 转为RGBA格式（增加alpha通道控制透明度）
@@ -1122,11 +1302,22 @@ class UnknownMapVisualizer:
                 # 生成网格坐标（y为行，x为列）
                 y_grid, x_grid = np.mgrid[0:self.env.height, 0:self.env.width]
                 radar_range = self.planner.radar.max_range + 0.5
+
+                # 创建总的雷达掩码
+                total_radar_mask = np.zeros((self.env.height, self.env.width), dtype=bool)
+
                 # 雷达扫过区域显示为已知地图
                 for (hx, hy) in self.radar_history:
                     distance = np.sqrt((y_grid - hy) ** 2 + (x_grid - hx) ** 2)
                     radar_mask = distance <= radar_range
                     unknown_map_rgba[radar_mask, 3] = 0
+                    total_radar_mask = total_radar_mask | radar_mask  # 合并所有雷达扫描区域
+
+                # 计算灰色区域（未扫描区域）的比例
+                total_cells = self.env.height * self.env.width
+                scanned_cells = np.sum(total_radar_mask)
+                unscanned_cells = total_cells - scanned_cells
+                scanned_ratio = 1.0 - unscanned_cells / total_cells
 
                 self.ax2.imshow(
                     unknown_map_rgba,
@@ -1136,19 +1327,23 @@ class UnknownMapVisualizer:
                 )
 
                 # 重新创建右侧动态元素
-                self.robot_pos2, = self.ax2.plot([x_pos], [y_pos], 'ro', markersize=10, alpha=0.9, zorder=5)
+                self.smooth_path_line2, = self.ax2.plot(smooth_path_x, smooth_path_y, 'b-',
+                                                        linewidth=3, alpha=0.8, zorder=4)
+                self.robot_pos2, = self.ax2.plot([x_pos], [y_pos], 'ro', markersize=15, alpha=0.9, zorder=5)
+                self.smooth_path_line2, = self.ax2.plot([x_pos], [y_pos], 'b-',
+                                                        linewidth=3, alpha=0.8, zorder=4)
 
-                if show_smooth_path and smooth_path_x and smooth_path_y:
-                    if frame < len(self.planner.smooth_path):
-                        current_smooth_segment = self.planner.smooth_path[:frame + 1]
-                        smooth_display_x = [p[1] for p in current_smooth_segment]
-                        smooth_display_y = [p[0] for p in current_smooth_segment]
-                    else:
-                        smooth_display_x = [p[1] for p in self.planner.smooth_path]
-                        smooth_display_y = [p[0] for p in self.planner.smooth_path]
-
-                    self.smooth_path_line2, = self.ax2.plot(smooth_display_x, smooth_display_y, 'b-',
-                                                            linewidth=3, alpha=0.8, zorder=4)
+                # if show_smooth_path and smooth_path_x and smooth_path_y:
+                #     if frame < len(self.planner.smooth_path):
+                #         current_smooth_segment = self.planner.smooth_path[:frame + 1]
+                #         smooth_display_x = [p[1] for p in current_smooth_segment]
+                #         smooth_display_y = [p[0] for p in current_smooth_segment]
+                #     else:
+                #         smooth_display_x = [p[1] for p in self.planner.smooth_path]
+                #         smooth_display_y = [p[0] for p in self.planner.smooth_path]
+                #
+                #     self.smooth_path_line2, = self.ax2.plot(smooth_display_x, smooth_display_y, 'b-',
+                #                                             linewidth=3, alpha=0.8, zorder=4)
 
                 # 绘制当前雷达范围
                 self.radar_circle2 = patches.Circle(
@@ -1157,18 +1352,17 @@ class UnknownMapVisualizer:
                     linewidth=2, alpha=0.6, zorder=4  # 层级高于历史痕迹
                 )
                 self.ax2.add_patch(self.radar_circle2)
-                self._plot_known_map(self.ax2,
-                                     f"known map (process: {(frame + 1) / len(self.planner.path) * 100:.1f}%)")
+                self._plot_known_map(self.ax2, f"known map (process: {scanned_ratio * 100:.1f}%)")
 
-            progress = (frame + 1) / len(self.planner.path) * 100
-            self.ax1.set_title(f'True_Env (Process: {progress:.1f}%)', fontsize=12, fontweight='bold')
+                progress = (frame + 1) / len(self.planner.path) * 100
+                self.ax1.set_title(f'True_Env (Process: {scanned_ratio * 100:.1f}%)', fontsize=12, fontweight='bold')
 
             return (self.robot_pos1, self.robot_pos2,
                     self.smooth_path_line1, self.smooth_path_line2,
                     self.radar_circle1, self.radar_circle2)
 
         anim = animation.FuncAnimation(
-            self.fig, update, frames=len(self.planner.path),
+            self.fig, update, frames=len(self.planner.smooth_path),
             init_func=init, interval=interval, blit=False, repeat=False
         )
 
@@ -1178,26 +1372,28 @@ class UnknownMapVisualizer:
     def clear_radar_history(self):
         self.radar_history.pop(0)
 
-
 def main():
     """主函数：创建并可视化森林环境"""
     print("🌲 森林环境可视化器")
     print("=" * 50)
 
-    # 创建环境可视化器
-    env = ForestEnvironmentVisualizer(width=70, height=70, seed=40)
-    # 波前法规划
-    planner = ImprovedWavefrontPlanner(env, radar_range=5, cell_size=2)
-    # 执行覆盖规划
-    planner.run_coverage(max_steps=3000, target_coverage=0.99, enable_smoothing=True)
+    # 1. 创建环境 (调大一点看起来更爽)
+    env = ForestEnvironmentVisualizer(width=100, height=100, seed=40)
 
-    # 可视化
+    # 2. 初始化 FALCON 规划器 (注意接口变化)
+    planner = FALCONPlanner(env, radar_range=10, cell_size=1)
+
+    # 3. 执行覆盖规划 (生成路径数据)
+    # 这一步会跑完整个模拟循环，把路径存在 planner.path 里
+    planner.run_coverage(max_steps=3000, target_coverage=0.985, enable_smoothing=True)
+
+    # 4. 可视化回放
     visualizer = UnknownMapVisualizer(env, planner)
     print("\n🎬 开始探索动画演示...")
-    anim = visualizer.animate_exploration(interval=20, show_smooth_path=True)
+    # interval 越小动画越快
+    anim = visualizer.animate_exploration(interval=10, show_smooth_path=True)
 
     return env, planner, anim
-
 
 if __name__ == "__main__":
     main()
